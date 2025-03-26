@@ -1,0 +1,977 @@
+import os
+import asyncio
+import json
+from pathlib import Path
+from telethon import TelegramClient
+from telethon.tl.types import InputPeerChannel
+from tqdm import tqdm
+from colorama import init, Fore, Style
+import questionary
+import sys
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                            QLineEdit, QPushButton, QComboBox, QProgressBar, 
+                            QLabel, QFileDialog, QDialog, QHBoxLayout, QGroupBox, 
+                            QMessageBox)
+from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QSize, QUrl
+from PyQt6.QtGui import QPalette, QColor, QDesktopServices
+from qasync import QEventLoop
+import telethon.errors
+import io
+import ctypes
+
+if os.name == 'nt':
+    whnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if whnd != 0:
+        ctypes.windll.user32.ShowWindow(whnd, 0)
+        ctypes.windll.kernel32.CloseHandle(whnd)
+
+class GuiOutput(io.StringIO):
+    def __init__(self, gui_callback):
+        super().__init__()
+        self.gui_callback = gui_callback
+        
+    def write(self, text):
+        if self.gui_callback:
+            self.gui_callback(text)
+            
+    def flush(self):
+        pass
+
+init(autoreset=True)
+
+CONFIG_FILE = Path('tg_media_config.json')
+DEFAULT_DOWNLOAD_FOLDER = 'telegram_downloads'
+
+class GuiInputOutput(io.StringIO):
+    def __init__(self, gui_callback):
+        super().__init__()
+        self.gui_callback = gui_callback
+        
+    def write(self, text):
+        if self.gui_callback:
+            self.gui_callback(text)
+        
+    def readline(self):
+        return "\n"
+
+class TelegramMediaDownloader:
+    def __init__(self):
+        self.config = self.load_config()
+        self._client = None
+        self.progress_callback = None
+        self._auth_lock = asyncio.Lock()
+        self._custom_input_callback = None
+        self.status_callback = None
+
+    def load_config(self):
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+                    if config.get('last_choice') not in ['photo', 'video', 'both']:
+                        config['last_choice'] = 'both'
+                    if 'download_order' not in config:
+                        config['download_order'] = 0
+                    return config
+            except json.JSONDecodeError:
+                pass
+        return {
+            'api_id': '',
+            'api_hash': '',
+            'last_channel': '',
+            'download_folder': DEFAULT_DOWNLOAD_FOLDER,
+            'total_files': '20',
+            'max_workers': '3',
+            'last_choice': 'both',
+            'download_order': 0
+        }
+
+    def save_config(self):
+        self.config['download_order'] = self.config['download_order']
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.config, f, indent=4)
+
+    async def show_header(self):
+        os.system('cls' if os.name == 'nt' else 'clear')
+        print(Fore.CYAN + r"""
+                                                
+  /$$$$$$   /$$$$$$  /$$$$$$$  /$$$$$$  /$$$$$$ 
+ /$$__  $$ /$$__  $$| $$__  $$|_  $$_/ /$$__  $$
+| $$  \__/| $$  \ $$| $$  \ $$  | $$  | $$  \__/
+| $$ /$$$$| $$  | $$| $$  | $$  | $$  |  $$$$$$ 
+| $$|_  $$| $$  | $$| $$  | $$  | $$   \____  $$
+| $$  \ $$| $$  | $$| $$  | $$  | $$   /$$  \ $$
+|  $$$$$$/|  $$$$$$/| $$$$$$$/ /$$$$$$|  $$$$$$/
+ \______/  \______/ |_______/ |______/ \______/ 
+         """ + Style.RESET_ALL)
+        print(Fore.YELLOW + " Telegram Media Downloader Pro (@GODIS)" + Style.RESET_ALL)
+        print(Fore.GREEN + "="*50 + Style.RESET_ALL)
+
+    async def get_inputs(self):
+        self.config['api_id'] = await questionary.text(
+            "Введите ваш API ID:",
+            default=self.config['api_id'],
+            validate=lambda x: x.isdigit()
+        ).ask_async()
+
+        self.config['api_hash'] = await questionary.text(
+            "Введите ваш API Hash:",
+            default=self.config['api_hash']
+        ).ask_async()
+
+        self.config['last_channel'] = await questionary.text(
+            "Введите @username или ID канала:",
+            default=self.config['last_channel']
+        ).ask_async()
+
+        self.config['download_folder'] = await questionary.text(
+            "Папка для сохранения:",
+            default=self.config['download_folder']
+        ).ask_async()
+
+        self.config['total_files'] = await questionary.text(
+            "Сколько файлов скачать (0 = все):",
+            default=self.config['total_files'],
+            validate=lambda x: x.isdigit()
+        ).ask_async()
+
+        self.config['max_workers'] = await questionary.text(
+            "Сколько одновременно загружать файлов:",
+            default=self.config['max_workers'],
+            validate=lambda x: x.isdigit() and int(x) > 0
+        ).ask_async()
+
+        choices = [
+            questionary.Choice("📷 Только фото", "photo"),
+            questionary.Choice("🎥 Только видео", "video"),
+            questionary.Choice("📷+🎥 Все медиа", "both")
+        ]
+        
+        self.config['last_choice'] = await questionary.select(
+            "Выберите тип контента:",
+            choices=choices,
+            default=self.config['last_choice']
+        ).ask_async()
+
+        self.save_config()
+
+    def set_progress_callback(self, callback):
+        self.progress_callback = callback
+
+    def set_custom_input_callback(self, callback):
+        self._custom_input_callback = callback
+
+    def set_status_callback(self, callback):
+        self.status_callback = callback
+
+    def update_status(self, message, color=Fore.WHITE):
+        if self.status_callback:
+            self.status_callback(message)
+        print(color + message + Style.RESET_ALL)
+
+    async def init_client(self):
+        async with self._auth_lock:
+            if self._client is None:
+                self._client = TelegramClient(
+                    'tg_session', 
+                    int(self.config['api_id']), 
+                    self.config['api_hash']
+                )
+                if self._custom_input_callback:
+                    self._client.set_proxy(None)
+                    self._client.flood_sleep_threshold = 0
+                    
+                    def custom_input(prompt):
+                        return self._custom_input_callback(prompt)
+                        
+                    self._client.phone_callback = custom_input
+                    self._client.code_callback = custom_input
+                    self._client.password_callback = custom_input
+            
+            if not self._client.is_connected():
+                await self._client.connect()
+                
+            return self._client
+
+    async def download_file(self, message, download_folder, semaphore, current_file, total_files):
+        async with semaphore:
+            try:
+                if self.progress_callback:
+                    progress = int((current_file / total_files) * 100)
+                    self.progress_callback(progress)
+                
+                status_msg = f'Загрузка файла {current_file} из {total_files}...'
+                self.update_status(status_msg, Fore.CYAN)
+
+                is_video = (hasattr(message, 'video') and message.video) or \
+                          (hasattr(message, 'document') and 
+                           hasattr(message.document, 'mime_type') and 
+                           'video' in message.document.mime_type)
+                
+                ext = 'jpg' if hasattr(message, 'photo') and message.photo else 'mp4' if is_video else 'dat'
+                filename = os.path.join(download_folder, f'media_{message.id}.{ext}')
+                
+                with tqdm(unit='B', unit_scale=True, desc=filename[-20:], leave=False) as pbar:
+                    await self._client.download_media(
+                        message,
+                        file=filename,
+                        progress_callback=lambda c,t: [setattr(pbar, 'total', t), pbar.update(c-pbar.n)]
+                    )
+                self.update_status(f'✅ Файл {current_file} загружен успешно', Fore.GREEN)
+                return True
+            except Exception as e:
+                error_msg = f'❌ Ошибка загрузки файла {current_file}: {str(e)}'
+                self.update_status(error_msg, Fore.RED)
+                return False
+
+    async def run(self):
+        if self.progress_callback:
+            self.progress_callback(0)
+
+        os.makedirs(self.config['download_folder'], exist_ok=True)
+
+        try:
+            self.update_status('🔄 Подключение к источнику...', Fore.YELLOW)
+
+            try:
+                source = self.config['last_channel']
+                if source.isdigit():
+                    source_id = int(source)
+                    self.update_status(f'Поиск по ID: {source_id}...', Fore.CYAN)
+                    try:
+                        entity = await self._client.get_entity(InputPeerChannel(source_id, 0))
+                    except ValueError:
+                        try:
+                            entity = await self._client.get_entity(source_id)
+                        except ValueError as e:
+                            self.update_status(f'❌ Ошибка: Не удалось найти канал или пользователя с ID {source_id}', Fore.RED)
+                            raise
+                else:
+                    username = source.lstrip('@')
+                    self.update_status(f'Поиск по имени пользователя: {username}...', Fore.CYAN)
+                    try:
+                        entity = await self._client.get_entity(username)
+                    except ValueError:
+                        self.update_status(f'❌ Ошибка: Не удалось найти {username}', Fore.RED)
+                        raise
+
+                entity_type = "канала" if hasattr(entity, "broadcast") else "пользователя"
+                entity_name = entity.title if hasattr(entity, "title") else f"@{entity.username}" if entity.username else f"пользователя {entity.first_name}"
+                
+                self.update_status(f'✅ Подключено к {entity_type}: {entity_name}', Fore.GREEN)
+                
+                self.update_status('🔍 Поиск медиафайлов...', Fore.BLUE)
+                
+                messages = []
+                total_files = int(self.config['total_files'])
+                processed_messages = 0
+                found_photos = 0
+                found_videos = 0
+                
+                try:
+                    reverse = bool(self.config.get('download_order', 0))
+                    self.update_status(
+                        f'🔍 Поиск медиафайлов {"снизу" if reverse else "сверху"}...',
+                        Fore.BLUE
+                    )
+                    
+                    async for message in self._client.iter_messages(entity, reverse=reverse):
+                        try:
+                            processed_messages += 1
+                            is_photo = hasattr(message, 'photo') and message.photo
+                            is_video = (hasattr(message, 'video') and message.video) or \
+                                    (hasattr(message, 'document') and 
+                                    hasattr(message.document, 'mime_type') and 
+                                    'video' in message.document.mime_type)
+                            
+                            if is_photo:
+                                found_photos += 1
+                            if is_video:
+                                found_videos += 1
+                            
+                            should_download = False
+                            if self.config['last_choice'] == "photo" and is_photo:
+                                should_download = True
+                            elif self.config['last_choice'] == "video" and is_video:
+                                should_download = True
+                            elif self.config['last_choice'] == "both" and (is_photo or is_video):
+                                should_download = True
+                                
+                            if should_download:
+                                messages.append(message)
+                                status_msg = (
+                                    f'📁 Найдено файлов для загрузки: {len(messages)}\n'
+                                    f'📷 Всего фото: {found_photos}\n'
+                                    f'🎥 Всего видео: {found_videos}\n'
+                                    f'💬 Проверено сообщений: {processed_messages}'
+                                )
+                                if total_files > 0:
+                                    status_msg += f'\n⚡ Осталось найти: {total_files - len(messages)}'
+                                self.update_status(status_msg, Fore.CYAN)
+                                
+                                if total_files > 0 and len(messages) >= total_files:
+                                    self.update_status(f'✅ Найдено запрошенное количество файлов: {total_files}', Fore.GREEN)
+                                    break
+                                
+                            if processed_messages % 100 == 0:
+                                self.update_status(
+                                    f'🔍 Поиск продолжается...\n'
+                                    f'Проверено: {processed_messages} сообщений\n'
+                                    f'Найдено файлов: {len(messages)}\n'
+                                    f'Осталось найти: {total_files - len(messages) if total_files > 0 else "∞"}',
+                                    Fore.BLUE
+                                )
+                                
+                        except Exception as msg_error:
+                            self.update_status(f'⚠️ Ошибка обработки сообщения: {str(msg_error)}', Fore.YELLOW)
+                            continue
+                            
+                except Exception as iter_error:
+                    self.update_status(f'❌ Ошибка при получении сообщений: {str(iter_error)}', Fore.RED)
+                    raise
+
+                if not messages:
+                    summary_msg = (
+                        f'⚠️ Подходящие файлы не найдены\n'
+                        f'📷 Всего фото: {found_photos}\n'
+                        f'🎥 Всего видео: {found_videos}\n'
+                        f'💬 Проверено сообщений: {processed_messages}'
+                    )
+                    self.update_status(summary_msg, Fore.YELLOW)
+                    return
+
+                summary_msg = (
+                    f'✅ Поиск завершен!\n'
+                    f'📷 Всего найдено фото: {found_photos}\n'
+                    f'🎥 Всего найдено видео: {found_videos}\n'
+                    f'💬 Всего проверено сообщений: {processed_messages}\n'
+                    f'⭐ Будет загружено: {len(messages)} файлов'
+                )
+                if total_files > 0 and len(messages) < total_files:
+                    summary_msg += f'\n⚠️ Внимание: Запрошено {total_files}, но найдено только {len(messages)} файлов'
+                self.update_status(summary_msg, Fore.GREEN)
+
+                self.update_status(f'🚀 Начинаю загрузку {len(messages)} файлов из {entity_type} {entity_name}...', Fore.GREEN)
+                
+                max_workers = int(self.config['max_workers'])
+                self.update_status(f'Используется {max_workers} потоков для загрузки', Fore.CYAN)
+                
+                semaphore = asyncio.Semaphore(max_workers)
+                tasks = []
+                
+                for i, msg in enumerate(messages):
+                    task = self.download_file(msg, self.config['download_folder'], semaphore, i+1, len(messages))
+                    tasks.append(task)
+                    self.update_status(f'Добавлена задача загрузки {i+1}/{len(messages)}', Fore.CYAN)
+                
+                self.update_status('Запуск задач загрузки...', Fore.CYAN)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                success_count = sum(1 for r in results if r is True)
+                error_count = len(messages) - success_count
+                
+                print("\n" + "="*50 + "\n")
+                
+                result_msg = (
+                    f'📊 Загрузка завершена!\n'
+                    f'✅ Успешно: {success_count}\n'
+                    f'❌ Ошибки: {error_count}\n'
+                    f'📁 Папка: {os.path.abspath(self.config["download_folder"])}'
+                )
+                self.update_status(result_msg, Fore.GREEN)
+
+            except Exception as e:
+                error_msg = f'❌ Ошибка: {str(e)}'
+                self.update_status(error_msg, Fore.RED)
+                raise
+
+        finally:
+            if self._client:
+                await self._client.disconnect()
+                self.update_status('Отключено от Telegram', Fore.YELLOW)
+
+class TelegramDownloaderGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.downloader = TelegramMediaDownloader()
+        self.auth_dialog = None
+        self.auth_in_progress = False
+        self.download_task = None
+        self.is_paused = False
+        self.is_stopped = False
+        
+        self.downloader.set_custom_input_callback(self.handle_telethon_input)
+        self.downloader.set_status_callback(lambda text: self.status_label.setText(text))
+        
+        self.gui_output = GuiOutput(self.handle_console_output)
+        sys.stdout = self.gui_output
+        sys.stderr = self.gui_output
+        
+        self.init_ui()
+        self.setup_animations()
+        
+    def setup_animations(self):
+        self.button_animations = {}
+        for btn in [self.start_btn, self.pause_btn, self.stop_btn]:
+            animation = QPropertyAnimation(btn, b"minimumSize")
+            animation.setDuration(100)
+            animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self.button_animations[btn] = animation
+            
+        self.progress_animation = QPropertyAnimation(self.progress, b"value")
+        self.progress_animation.setDuration(500)
+        self.progress_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        
+    def animate_button(self, button, pressed=True):
+        if button in self.button_animations:
+            animation = self.button_animations[button]
+            current_size = button.size()
+            if pressed:
+                animation.setStartValue(current_size)
+                animation.setEndValue(QSize(current_size.width() - 5, current_size.height() - 5))
+            else:
+                animation.setStartValue(current_size)
+                animation.setEndValue(QSize(current_size.width() + 5, current_size.height() + 5))
+            animation.start()
+            
+    def animate_progress(self, value):
+        self.progress_animation.setStartValue(self.progress.value())
+        self.progress_animation.setEndValue(value)
+        self.progress_animation.start()
+        
+    def init_ui(self):
+        self.setWindowTitle('Telegram Media Downloader Pro (@GODIS0)')
+        self.setFixedSize(600, 550)
+        
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+        layout.setSpacing(10)
+        
+        api_group = QGroupBox('Настройки API Telegram')
+        api_layout = QVBoxLayout()
+        
+        api_id_layout = QHBoxLayout()
+        self.api_id = QLineEdit(self.downloader.config['api_id'])
+        self.api_id.setPlaceholderText('Введите API ID')
+        api_id_layout.addWidget(QLabel('API ID:'))
+        api_id_layout.addWidget(self.api_id)
+        api_id_help = QPushButton('?')
+        api_id_help.setFixedSize(25, 25)
+        api_id_help.clicked.connect(lambda: QMessageBox.information(self, 'Помощь',
+            'API ID можно получить на my.telegram.org\n'
+            '1. Войдите в свой аккаунт\n'
+            '2. Перейдите в "API development tools"\n'
+            '3. Создайте новое приложение'))
+        api_id_layout.addWidget(api_id_help)
+        api_layout.addLayout(api_id_layout)
+        
+        api_hash_layout = QHBoxLayout()
+        self.api_hash = QLineEdit(self.downloader.config['api_hash'])
+        self.api_hash.setPlaceholderText('Введите API Hash')
+        api_hash_layout.addWidget(QLabel('API Hash:'))
+        api_hash_layout.addWidget(self.api_hash)
+        api_hash_help = QPushButton('?')
+        api_hash_help.setFixedSize(25, 25)
+        api_hash_help.clicked.connect(lambda: QMessageBox.information(self, 'Помощь',
+            'API Hash можно получить там же, где и API ID\n'
+            'Это длинная строка символов под API ID'))
+        api_hash_layout.addWidget(api_hash_help)
+        api_layout.addLayout(api_hash_layout)
+        
+        self.check_auth_btn = QPushButton('Войти в Telegram')
+        self.check_auth_btn.clicked.connect(self.check_auth)
+        api_layout.addWidget(self.check_auth_btn)
+        
+        api_group.setLayout(api_layout)
+        layout.addWidget(api_group)
+        
+        download_group = QGroupBox('Настройки загрузки')
+        download_layout = QVBoxLayout()
+        
+        source_layout = QHBoxLayout()
+        self.channel = QLineEdit(self.downloader.config['last_channel'])
+        self.channel.setPlaceholderText('Например: @channel или @username')
+        source_layout.addWidget(QLabel('Источник:'))
+        source_layout.addWidget(self.channel)
+        source_help = QPushButton('?')
+        source_help.setFixedSize(25, 25)
+        source_help.clicked.connect(lambda: QMessageBox.information(self, 'Помощь',
+            'Введите:\n'
+            '• @username канала или пользователя\n'
+            '• ID канала\n'
+            '• Ссылку на канал'))
+        source_layout.addWidget(source_help)
+        download_layout.addLayout(source_layout)
+        
+        folder_layout = QHBoxLayout()
+        self.folder_path = QLineEdit(self.downloader.config['download_folder'])
+        self.folder_path.setPlaceholderText('Путь к папке для сохранения')
+        folder_layout.addWidget(QLabel('Папка:'))
+        folder_layout.addWidget(self.folder_path)
+        self.folder_btn = QPushButton('Выбрать')
+        self.folder_btn.clicked.connect(self.select_folder)
+        folder_layout.addWidget(self.folder_btn)
+        download_layout.addLayout(folder_layout)
+        
+        counts_layout = QHBoxLayout()
+        
+        files_layout = QVBoxLayout()
+        files_layout.addWidget(QLabel('Количество файлов:'))
+        self.total_files = QLineEdit(self.downloader.config['total_files'])
+        self.total_files.setPlaceholderText('0 = все файлы')
+        files_layout.addWidget(self.total_files)
+        counts_layout.addLayout(files_layout)
+        
+        workers_layout = QVBoxLayout()
+        workers_layout.addWidget(QLabel('Потоков загрузки:'))
+        self.max_workers = QLineEdit(self.downloader.config['max_workers'])
+        self.max_workers.setPlaceholderText('Рекомендуется: 3-5')
+        workers_layout.addWidget(self.max_workers)
+        counts_layout.addLayout(workers_layout)
+        
+        download_layout.addLayout(counts_layout)
+        
+        content_layout = QHBoxLayout()
+        content_layout.addWidget(QLabel('Тип контента:'))
+        self.content_type = QComboBox()
+        self.content_type.addItems(['Только фото', 'Только видео', 'Все медиафайлы'])
+        content_layout.addWidget(self.content_type)
+        download_layout.addLayout(content_layout)
+        
+        order_layout = QHBoxLayout()
+        order_layout.addWidget(QLabel('Порядок загрузки:'))
+        self.download_order = QComboBox()
+        self.download_order.addItems(['С начала чата (сверху)', 'С конца чата (снизу)'])
+        order_layout.addWidget(self.download_order)
+        download_layout.addLayout(order_layout)
+        
+        download_group.setLayout(download_layout)
+        layout.addWidget(download_group)
+        
+        progress_group = QGroupBox('Прогресс загрузки')
+        progress_layout = QVBoxLayout()
+        
+        self.progress = QProgressBar()
+        self.progress.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid #2196F3;
+                border-radius: 5px;
+                text-align: center;
+                background-color: #E3F2FD;
+            }
+            QProgressBar::chunk {
+                background-color: #2196F3;
+                border-radius: 3px;
+            }
+        """)
+        progress_layout.addWidget(self.progress)
+        
+        self.status_label = QLabel('')
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet('color: green;')
+        progress_layout.addWidget(self.status_label)
+        
+        progress_group.setLayout(progress_layout)
+        layout.addWidget(progress_group)
+        
+        control_layout = QHBoxLayout()
+        
+        self.start_btn = QPushButton('Старт')
+        self.start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 10px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #1565C0;
+            }
+        """)
+        self.start_btn.clicked.connect(self.on_download_clicked)
+        control_layout.addWidget(self.start_btn)
+        
+        self.pause_btn = QPushButton('Пауза')
+        self.pause_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 10px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #1565C0;
+            }
+        """)
+        self.pause_btn.clicked.connect(self.toggle_pause)
+        self.pause_btn.setEnabled(False)
+        control_layout.addWidget(self.pause_btn)
+        
+        self.stop_btn = QPushButton('Стоп')
+        self.stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 10px 20px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:pressed {
+                background-color: #1565C0;
+            }
+        """)
+        self.stop_btn.clicked.connect(self.stop_download)
+        self.stop_btn.setEnabled(False)
+        control_layout.addWidget(self.stop_btn)
+        
+        layout.addLayout(control_layout)
+        
+        bottom_layout = QHBoxLayout()
+
+        author_label = QLabel('Created by @GODIS & @h1qzeks')
+        author_label.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        author_label.setStyleSheet('color: gray;')
+        
+        support_label = QLabel('<a href="https://www.donationalerts.com/r/h1qzeks">Поддержать</a>')
+        support_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        support_label.setStyleSheet('''
+            QLabel {
+                color: #2196F3;
+                text-decoration: none;
+            }
+            QLabel:hover {
+                color: #1976D2;
+            }
+        ''')
+        support_label.setOpenExternalLinks(True)
+        
+        bottom_layout.addWidget(author_label)
+        bottom_layout.addWidget(support_label)
+        layout.addLayout(bottom_layout)
+        
+    def select_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, 'Выберите папку для сохранения')
+        if folder:
+            self.folder_path.setText(folder)
+            
+    def on_download_clicked(self):
+        loop = asyncio.get_event_loop()
+        task = loop.create_task(self.start_download())
+        task.add_done_callback(self.handle_download_complete)
+        
+    def handle_download_complete(self, future):
+        try:
+            future.result()
+        except Exception as e:
+            self.status_label.setText(f'Ошибка: {str(e)}')
+        finally:
+            self.start_btn.setEnabled(True)
+            self.pause_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            
+    def handle_console_output(self, text):
+        if hasattr(self, 'auth_status'):
+            clean_text = text.replace(Fore.YELLOW, '').replace(Fore.GREEN, '')\
+                            .replace(Fore.RED, '').replace(Fore.CYAN, '')\
+                            .replace(Fore.BLUE, '').replace(Style.RESET_ALL, '')
+            clean_text = clean_text.strip()
+            if clean_text:
+                self.auth_status.setText(clean_text)
+                
+    def handle_telethon_input(self, prompt):
+        if "phone" in prompt.lower():
+            return self.phone_input.text().strip() + "\n"
+        elif "code" in prompt.lower():
+            return self.code_input.text().strip() + "\n"
+        elif "password" in prompt.lower() or "2fa" in prompt.lower():
+            return self.password_input.text().strip() + "\n"
+        return "\n"
+
+    def create_auth_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Авторизация Telegram')
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        
+        phone_label = QLabel('Введите номер телефона:')
+        self.phone_input = QLineEdit()
+        self.phone_input.setPlaceholderText('+79999999999')
+        layout.addWidget(phone_label)
+        layout.addWidget(self.phone_input)
+        
+        code_label = QLabel('Код из Telegram:')
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText('12345')
+        self.code_input.hide()
+        code_label.hide()
+        layout.addWidget(code_label)
+        layout.addWidget(self.code_input)
+        
+        password_label = QLabel('Пароль двухфакторной аутентификации:')
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText('Введите пароль 2FA')
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_input.hide()
+        password_label.hide()
+        layout.addWidget(password_label)
+        layout.addWidget(self.password_input)
+        
+        button_box = QHBoxLayout()
+        self.send_code_btn = QPushButton('Отправить код')
+        self.send_code_btn.clicked.connect(self.handle_send_code)
+        self.verify_code_btn = QPushButton('Подтвердить')
+        self.verify_code_btn.clicked.connect(self.handle_verify_code)
+        self.verify_code_btn.hide()
+        
+        button_box.addWidget(self.send_code_btn)
+        button_box.addWidget(self.verify_code_btn)
+        layout.addLayout(button_box)
+        
+        self.auth_status = QLabel('')
+        layout.addWidget(self.auth_status)
+        
+        return dialog
+        
+    def handle_send_code(self):
+        if self.auth_in_progress:
+            return
+            
+        phone = self.phone_input.text().strip()
+        if not phone:
+            self.auth_status.setText('Введите номер телефона!')
+            return
+            
+        self.auth_in_progress = True
+        self.send_code_btn.setEnabled(False)
+        self.auth_status.setText('Отправка кода...')
+        
+        async def send_code():
+            try:
+                client = await self.downloader.init_client()
+                await client.send_code_request(phone)
+                
+                self.auth_status.setText('Код отправлен! Введите его ниже.')
+                self.code_input.show()
+                self.code_input.parentWidget().findChild(QLabel, '', Qt.FindChildOption.FindDirectChildrenOnly).show()
+                self.verify_code_btn.show()
+                self.code_input.setFocus()
+                
+            except Exception as e:
+                self.auth_status.setText(f'Ошибка: {str(e)}')
+                self.send_code_btn.setEnabled(True)
+            finally:
+                self.auth_in_progress = False
+        
+        asyncio.create_task(send_code())
+        
+    def handle_verify_code(self):
+        if self.auth_in_progress:
+            return
+            
+        phone = self.phone_input.text().strip()
+        code = self.code_input.text().strip()
+        if not code:
+            self.auth_status.setText('Введите код!')
+            return
+            
+        self.auth_in_progress = True
+        self.verify_code_btn.setEnabled(False)
+        self.auth_status.setText('Проверка кода...')
+        
+        async def verify():
+            try:
+                client = await self.downloader.init_client()
+                try:
+                    await client.sign_in(phone, code)
+                except telethon.errors.SessionPasswordNeededError:
+                    self.auth_status.setText('Требуется пароль двухфакторной аутентификации')
+                    self.password_input.show()
+                    self.password_input.parentWidget().findChild(QLabel, '', Qt.FindChildOption.FindDirectChildrenOnly).show()
+                    self.password_input.setFocus()
+                    self.verify_code_btn.setText('Войти')
+                    self.verify_code_btn.setEnabled(True)
+                    return
+                
+                self.auth_status.setText('Успешная авторизация!')
+                self.status_label.setText('✅ Авторизация успешна')
+                self.auth_dialog.accept()
+                
+            except Exception as e:
+                if "2FA" in str(e) or "password" in str(e).lower():
+                    self.auth_status.setText('Требуется пароль двухфакторной аутентификации')
+                    self.password_input.show()
+                    self.password_input.parentWidget().findChild(QLabel, '', Qt.FindChildOption.FindDirectChildrenOnly).show()
+                    self.password_input.setFocus()
+                    self.verify_code_btn.setText('Войти')
+                    self.verify_code_btn.setEnabled(True)
+                else:
+                    self.auth_status.setText(f'Ошибка: {str(e)}')
+                    self.verify_code_btn.setEnabled(True)
+            finally:
+                self.auth_in_progress = False
+        
+        if self.password_input.isVisible():
+            password = self.password_input.text().strip()
+            if not password:
+                self.auth_status.setText('Введите пароль 2FA!')
+                self.verify_code_btn.setEnabled(True)
+                return
+                
+            async def verify_2fa():
+                try:
+                    client = await self.downloader.init_client()
+                    await client.sign_in(password=password)
+                    self.auth_status.setText('Успешная авторизация!')
+                    self.status_label.setText('✅ Авторизация успешна')
+                    self.auth_dialog.accept()
+                except Exception as e:
+                    self.auth_status.setText(f'Ошибка: {str(e)}')
+                    self.verify_code_btn.setEnabled(True)
+                finally:
+                    self.auth_in_progress = False
+                    
+            asyncio.create_task(verify_2fa())
+        else:
+            asyncio.create_task(verify())
+        
+    def check_auth(self):
+        if self.auth_in_progress:
+            return
+            
+        if not self.api_id.text() or not self.api_hash.text():
+            self.status_label.setText('Сначала введите API ID и API Hash!')
+            return
+            
+        self.auth_in_progress = True
+        self.check_auth_btn.setEnabled(False)
+        
+        async def check():
+            try:
+                self.downloader.config['api_id'] = self.api_id.text()
+                self.downloader.config['api_hash'] = self.api_hash.text()
+                self.downloader.save_config()
+                
+                client = await self.downloader.init_client()
+                
+                if not await client.is_user_authorized():
+                    if self.auth_dialog is None:
+                        self.auth_dialog = self.create_auth_dialog()
+                    self.auth_dialog.show()
+                else:
+                    self.status_label.setText('✅ Авторизация успешна')
+                    
+            except Exception as e:
+                self.status_label.setText(f'Ошибка: {str(e)}')
+            finally:
+                self.check_auth_btn.setEnabled(True)
+                self.auth_in_progress = False
+        
+        asyncio.create_task(check())
+        
+    def toggle_pause(self):
+        if self.is_paused:
+            self.is_paused = False
+            self.pause_btn.setText('Пауза')
+            self.status_label.setText('Загрузка возобновлена')
+            self.animate_progress(self.progress.value())
+        else:
+            self.is_paused = True
+            self.pause_btn.setText('Продолжить')
+            self.status_label.setText('Загрузка приостановлена')
+            
+    def stop_download(self):
+        self.is_stopped = True
+        self.is_paused = False
+        self.start_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.status_label.setText('Загрузка остановлена')
+        self.animate_progress(0)
+        
+    async def start_download(self):
+        if not self.api_id.text() or not self.api_hash.text() or not self.channel.text():
+            self.status_label.setText('Ошибка: Заполните все обязательные поля!')
+            return
+
+        self.progress.setValue(0)
+        self.start_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self.is_paused = False
+        self.is_stopped = False
+        self.status_label.setText('Загрузка начата...')
+        
+        try:
+            self.downloader.config['api_id'] = self.api_id.text()
+            self.downloader.config['api_hash'] = self.api_hash.text()
+            self.downloader.config['last_channel'] = self.channel.text()
+            self.downloader.config['download_folder'] = self.folder_path.text()
+            self.downloader.config['total_files'] = self.total_files.text()
+            self.downloader.config['max_workers'] = self.max_workers.text()
+            self.downloader.config['last_choice'] = ['photo', 'video', 'both'][
+                self.content_type.currentIndex()]
+            self.downloader.config['download_order'] = self.download_order.currentIndex()
+            
+            self.downloader.save_config()
+            
+            if not await self.downloader._client.is_user_authorized():
+                self.status_label.setText('Необходима авторизация!')
+                await self.check_auth()
+                return
+            
+            self.downloader.set_progress_callback(lambda p: self.animate_progress(p))
+            
+            old_stdout = sys.stdout
+            sys.stdout = self.gui_output
+            try:
+                self.download_task = asyncio.create_task(self.downloader.run())
+                await self.download_task
+                if not self.is_stopped:
+                    self.status_label.setText('Загрузка успешно завершена!')
+                    self.animate_progress(100)
+            finally:
+                sys.stdout = old_stdout
+                self.start_btn.setEnabled(True)
+                self.pause_btn.setEnabled(False)
+                self.stop_btn.setEnabled(False)
+            
+        except Exception as e:
+            self.status_label.setText(f'Ошибка: {str(e)}')
+            self.start_btn.setEnabled(True)
+            self.pause_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            raise
+
+    def closeEvent(self, event):
+        sys.stdout = sys.__stdout__
+        super().closeEvent(event)
+
+def main():
+    app = QApplication(sys.argv)
+    
+    loop = QEventLoop(app)
+    asyncio.set_event_loop(loop)
+    
+    window = TelegramDownloaderGUI()
+    window.show()
+    
+    with loop:
+        loop.run_forever()
+
+if __name__ == '__main__':
+    main()
